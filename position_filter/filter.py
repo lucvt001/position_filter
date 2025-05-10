@@ -54,7 +54,7 @@ class PositionFilter(Node):
             self.child_frame = self.child_frame.replace("NS", ns)
 
         # Timer for predict step of the filter
-        self.timer = self.create_timer(self.dt, self.filter_predict)
+        self.timer = self.create_timer(self.dt, self.filter_predict, clock=self.get_clock())
 
         # Initialize the filter
         # State: [pos_x, vel_x, pos_y, vel_y]
@@ -82,7 +82,6 @@ class PositionFilter(Node):
             return
         self.ukf.predict()
         self.publish_state_and_covariance()       
-        # self.get_logger().info(f'UKF state: {self.ukf.x.tolist()}')
 
     def state_transition_function(self, x: np.ndarray, dt: float):
         pos_x, vel_x, pos_y, vel_y = x
