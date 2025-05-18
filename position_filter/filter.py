@@ -8,6 +8,7 @@ from filterpy.common import Q_discrete_white_noise
 from functools import partial
 from collections import deque
 from tf2_ros import TransformBroadcaster
+from scipy.linalg import sqrtm
 
 class PositionFilter(Node):
 
@@ -69,7 +70,7 @@ class PositionFilter(Node):
 
     def filter_reset(self):
         points = MerweScaledSigmaPoints(n=4, alpha=1e-2, beta=2., kappa=-1.0)
-        self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=self.dt, points=points, fx=self.state_transition_function, hx=None)    
+        self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=self.dt, points=points, fx=self.state_transition_function, hx=None, sqrt_fn=sqrtm)    
         self.ukf.x = np.array(self.initial_estimate)  # Initial state estimate
         self.ukf.P = np.diag([9., 9., 9., 9.])
         self.ukf.Q = Q_discrete_white_noise(dim=2, dt=self.dt, var=self.Q_std**2, block_size=2)
