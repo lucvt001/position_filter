@@ -25,6 +25,7 @@ class PositionFilter(Node):
         self.child_frame = self.declare_parameter("child_frame", "follower/ukf_link").get_parameter_value().string_value
         self.Q_std = self.declare_parameter("Q_std", 0.9).get_parameter_value().double_value
         self.R_std = self.declare_parameter("R_std", 0.3).get_parameter_value().double_value
+        self.debug_log = self.declare_parameter("debug_log", False).get_parameter_value().bool_value
 
         # Offsets
         self.leader1_offset = np.array([0., 0.])
@@ -48,9 +49,6 @@ class PositionFilter(Node):
             self.child_frame = self.child_frame.replace("NS", ns)
 
         self.initialize_filter()
-        self.initial_d1, self.initial_d2 = None, None
-        
-        self.prev_update_time = self.get_clock().now()
 
         self.rolling_pos_x = deque(maxlen=4)
         self.rolling_pos_y = deque(maxlen=4)
@@ -65,6 +63,8 @@ class PositionFilter(Node):
         self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=0.5, hx=None, fx=self.state_transition_function, points=points, sqrt_fn=sqrtm)    
         self.ukf.P = np.diag([6.0**2, 3.0**2, 6.0**2, 3.0**2])
         self.ukf.R = np.array([self.R_std**2]) # Measurement noise
+        self.initial_d1, self.initial_d2 = None, None
+        self.prev_update_time = self.get_clock().now()
 
     def state_transition_function(self, x: np.ndarray, dt: float):
         pos_x, vel_x, pos_y, vel_y = x
@@ -84,29 +84,40 @@ class PositionFilter(Node):
                 self.ukf.x = np.array([pos_x, 0., pos_y, 0.])
                 self.get_logger().info(f'Initial state set: {self.ukf.x.tolist()}')
             return
+        
+        # Check if the filter has diverged. If yes, reinitialize.
+        if self.ukf.P[0, 0] > 150.0 or self.ukf.P[2, 2] > 150.0:
+            self.get_logger().warn(f'Covariance too high: {np.diag(self.ukf.P).tolist()}')
+            self.get_logger().warn("Filter diverged, reinitializing...")
+            self.initialize_filter()
+            return
 
+        # Assuming the above checks are passed, compute the time elapsed since the last update
         time_now = self.get_clock().now()
         time_elapsed = (time_now - self.prev_update_time).nanoseconds / 1e9
-        time_elapsed = min(time_elapsed, 3.0)  # Limit time elapsed to 3 seconds
+        time_elapsed = min(time_elapsed, 3.0)  # Limit time elapsed to 3 seconds to avoid filter divergence due to too large predict covariance
 
         # Predict step of the filter
         self.ukf.Q = Q_discrete_white_noise(dim=2, dt=time_elapsed, var=self.Q_std**2, block_size=2)
         self.ukf.predict(dt=time_elapsed)
         self.publish_state_and_covariance()
-        # self.get_logger().info(f'Predicted state: {self.ukf.x.tolist()} with dt: {time_elapsed}')
-        # self.get_logger().info(f'Predicted covariance: {np.diag(self.ukf.P).tolist()}')
+        if self.debug_log:
+            self.get_logger().info(f'Predicted state: {self.ukf.x.tolist()} with dt: {time_elapsed}')
+            self.get_logger().info(f'Predicted covariance: {np.diag(self.ukf.P).tolist()}')
 
         # Update step of the filter
         measurement = msg.data
         self.ukf.update(z=measurement, hx=partial(self.measurement_function, offset=offset))
         self.prev_update_time = time_now
 
+        # Send filtered data
         self.broadcast_transform(smoothen=False)
         self.publish_state_and_covariance()
 
-        # self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
-        # self.get_logger().info(f'Updated state: {self.ukf.x.tolist()}')
-        # self.get_logger().info(f'Updated covariance: {np.diag(self.ukf.P).tolist()}')
+        if self.debug_log:
+            self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
+            self.get_logger().info(f'Updated state: {self.ukf.x.tolist()}')
+            self.get_logger().info(f'Updated covariance: {np.diag(self.ukf.P).tolist()}')
 
     def measurement_function(self, x: np.ndarray, offset: np.ndarray):
         pos_x, _, pos_y, _ = x
