@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'position_filter = position_filter.filter:main'
+            'filter = position_filter.filter:main',
+            'filter2 = position_filter.filter2:main'
         ],
     },
 )

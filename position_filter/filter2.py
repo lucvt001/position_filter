@@ -15,9 +15,6 @@ class PositionFilter(Node):
     def __init__(self):
         super().__init__('position_filter')
 
-        # Initialize class variables
-        self.dt = 0.1
-
         # Parameters
         leader2_offset = self.declare_parameter("leader2_offset", -10.0).get_parameter_value().double_value
         leader1_distance_topic = self.declare_parameter("leader1_distance_topic", "distance_to_leader1").get_parameter_value().string_value
@@ -51,35 +48,20 @@ class PositionFilter(Node):
         if self.child_frame.startswith("NS"):
             self.child_frame = self.child_frame.replace("NS", ns)
 
-        # Timer for predict step of the filter
-        self.timer = self.create_timer(self.dt, self.filter_predict, clock=self.get_clock())
-
         # Initialize the filter
         # State: [pos_x, vel_x, pos_y, vel_y]
         # Measurement: [distance_to_leader1], or [distance_to_leader2]  
-
-        self.filter_reset()
+        points = MerweScaledSigmaPoints(n=4, alpha=1e-2, beta=2., kappa=-1.0)
+        self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=0.5, hx=None, fx=self.state_transition_function, points=points, sqrt_fn=sqrtm)    
+        self.ukf.x = np.array(self.initial_estimate)  # Initial state estimate
+        self.ukf.P = np.diag([100., 9., 100., 9.])
+        self.ukf.R = np.array([self.R_std**2]) # Measurement noise
+        self.get_logger().info(f'UKF initialized with state: {self.ukf.x.tolist()}')   
         self.prev_update_time = self.get_clock().now()
 
         self.rolling_pos_x = deque(maxlen=4)
         self.rolling_pos_y = deque(maxlen=4)
-        self.wma_weights = np.array([0.1, 0.2, 0.2, 0.5])
-
-    def filter_reset(self):
-        points = MerweScaledSigmaPoints(n=4, alpha=1e-2, beta=2., kappa=-1.0)
-        self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=self.dt, points=points, fx=self.state_transition_function, hx=None, sqrt_fn=sqrtm)    
-        self.ukf.x = np.array(self.initial_estimate)  # Initial state estimate
-        self.ukf.P = np.diag([9., 9., 9., 9.])
-        self.ukf.Q = Q_discrete_white_noise(dim=2, dt=self.dt, var=self.Q_std**2, block_size=2)
-        self.ukf.R = np.array([self.R_std**2]) # Measurement noise
-        self.get_logger().info(f'UKF initialized with state: {self.ukf.x.tolist()}')
-
-    def filter_predict(self):
-        P = self.ukf.P.diagonal()
-        if P[0] > 20 and P[2] > 20:  # Stop predicting if the covariance is too large because it means there has been no update for a while
-            return
-        self.ukf.predict()
-        self.publish_state_and_covariance()       
+        self.wma_weights = np.array([0.1, 0.2, 0.2, 0.5]) 
 
     def state_transition_function(self, x: np.ndarray, dt: float):
         pos_x, vel_x, pos_y, vel_y = x
@@ -90,16 +72,26 @@ class PositionFilter(Node):
     def distance_cb(self, msg: Float32, offset: np.ndarray):
         time_now = self.get_clock().now()
         time_elapsed = (time_now - self.prev_update_time).nanoseconds / 1e9
-        if time_elapsed <= 0.11:    # to avoid updating the filter many times at once which can cause it to collapse
-            return 
-        self.prev_update_time = time_now
-        
+        time_elapsed = min(time_elapsed, 3.0)  # Limit time elapsed to 3 seconds
+
+        # Predict step of the filter
+        self.ukf.Q = Q_discrete_white_noise(dim=2, dt=time_elapsed, var=self.Q_std**2, block_size=2)
+        self.ukf.predict(dt=time_elapsed)
+        self.publish_state_and_covariance()
+        # self.get_logger().info(f'Predicted state: {self.ukf.x.tolist()} with dt: {time_elapsed}')
+        # self.get_logger().info(f'Predicted covariance: {np.diag(self.ukf.P).tolist()}')
+
+        # Update step of the filter
         measurement = msg.data
-        self.ukf.hx = partial(self.measurement_function, offset=offset)
-        self.ukf.update(z=measurement)
+        # self.ukf.hx = partial(self.measurement_function, offset=offset)
+        self.ukf.update(z=measurement, hx=partial(self.measurement_function, offset=offset))
+        self.prev_update_time = time_now
 
         self.smoothen_state_and_broadcast_transform()
         self.publish_state_and_covariance()
+
+        # self.get_logger().info(f'Updated state: {self.ukf.x.tolist()}')
+        # self.get_logger().info(f'Updated covariance: {np.diag(self.ukf.P).tolist()}')
 
     def measurement_function(self, x: np.ndarray, offset: np.ndarray):
         pos_x, _, pos_y, _ = x
