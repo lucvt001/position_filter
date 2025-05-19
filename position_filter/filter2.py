@@ -25,7 +25,6 @@ class PositionFilter(Node):
         self.child_frame = self.declare_parameter("child_frame", "follower/ukf_link").get_parameter_value().string_value
         self.Q_std = self.declare_parameter("Q_std", 0.9).get_parameter_value().double_value
         self.R_std = self.declare_parameter("R_std", 0.3).get_parameter_value().double_value
-        self.initial_estimate = self.declare_parameter("initial_estimate", [-10.0, 0.0, -2.0, 0.0]).get_parameter_value().double_array_value
 
         # Offsets
         self.leader1_offset = np.array([0., 0.])
@@ -48,20 +47,24 @@ class PositionFilter(Node):
         if self.child_frame.startswith("NS"):
             self.child_frame = self.child_frame.replace("NS", ns)
 
-        # Initialize the filter
-        # State: [pos_x, vel_x, pos_y, vel_y]
-        # Measurement: [distance_to_leader1], or [distance_to_leader2]  
-        points = MerweScaledSigmaPoints(n=4, alpha=1e-2, beta=2., kappa=-1.0)
-        self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=0.5, hx=None, fx=self.state_transition_function, points=points, sqrt_fn=sqrtm)    
-        self.ukf.x = np.array(self.initial_estimate)  # Initial state estimate
-        self.ukf.P = np.diag([100., 9., 100., 9.])
-        self.ukf.R = np.array([self.R_std**2]) # Measurement noise
-        self.get_logger().info(f'UKF initialized with state: {self.ukf.x.tolist()}')   
+        self.initialize_filter()
+        self.initial_d1, self.initial_d2 = None, None
+        
         self.prev_update_time = self.get_clock().now()
 
         self.rolling_pos_x = deque(maxlen=4)
         self.rolling_pos_y = deque(maxlen=4)
         self.wma_weights = np.array([0.1, 0.2, 0.2, 0.5]) 
+
+    def initialize_filter(self):
+        # State: [pos_x, vel_x, pos_y, vel_y]
+        # Measurement: [distance_to_leader1], or [distance_to_leader2]  
+        # We dont initialize x here, default to np.zeros(dim_x)
+        # So that we can compute the intial state separately
+        points = MerweScaledSigmaPoints(n=4, alpha=1e-2, beta=2., kappa=-1.0)
+        self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=0.5, hx=None, fx=self.state_transition_function, points=points, sqrt_fn=sqrtm)    
+        self.ukf.P = np.diag([6.0**2, 3.0**2, 6.0**2, 3.0**2])
+        self.ukf.R = np.array([self.R_std**2]) # Measurement noise
 
     def state_transition_function(self, x: np.ndarray, dt: float):
         pos_x, vel_x, pos_y, vel_y = x
@@ -70,6 +73,18 @@ class PositionFilter(Node):
         return np.array([pos_x, vel_x, pos_y, vel_y])
 
     def distance_cb(self, msg: Float32, offset: np.ndarray):
+        # Compute the initial estimate of the state using the triangulation method
+        if np.array_equal(self.ukf.x, np.zeros(4)):
+            if self.initial_d1 is None and np.array_equal(offset, self.leader1_offset):
+                self.initial_d1 = msg.data
+            elif self.initial_d2 is None and np.array_equal(offset, self.leader2_offset):
+                self.initial_d2 = msg.data
+            elif self.initial_d1 is not None and self.initial_d2 is not None:
+                pos_x, pos_y = self.triangulate(np.abs(self.leader2_offset[1]), self.initial_d1, self.initial_d2)
+                self.ukf.x = np.array([pos_x, 0., pos_y, 0.])
+                self.get_logger().info(f'Initial state set: {self.ukf.x.tolist()}')
+            return
+
         time_now = self.get_clock().now()
         time_elapsed = (time_now - self.prev_update_time).nanoseconds / 1e9
         time_elapsed = min(time_elapsed, 3.0)  # Limit time elapsed to 3 seconds
@@ -86,7 +101,7 @@ class PositionFilter(Node):
         self.ukf.update(z=measurement, hx=partial(self.measurement_function, offset=offset))
         self.prev_update_time = time_now
 
-        self.smoothen_state_and_broadcast_transform()
+        self.broadcast_transform(smoothen=False)
         self.publish_state_and_covariance()
 
         # self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
@@ -96,6 +111,16 @@ class PositionFilter(Node):
     def measurement_function(self, x: np.ndarray, offset: np.ndarray):
         pos_x, _, pos_y, _ = x
         return np.sqrt([ (pos_x-offset[0]) ** 2 + (pos_y-offset[1]) ** 2 ])
+    
+    def triangulate(self, d, d1, d2):
+        # Given a triangle with sides d1, d2 and distance d between the two points
+        # Calculate the coordinates of the third point in FLU frame
+        # Using the Law of Cosines to find the angle between d and d1
+        cosine = (d**2 + d1**2 - d2**2) / (2 * d * d1)
+        angle = np.arccos(cosine)
+        sine = np.sin(angle)
+        pos_x, pos_y = -d1*sine , -d1*cosine     # FLU frame
+        return (pos_x, pos_y)
 
     def publish_state_and_covariance(self):
         state = Float32MultiArray()
@@ -106,10 +131,11 @@ class PositionFilter(Node):
         covariance.data = self.ukf.P.flatten().tolist()
         self.covariance_pub.publish(covariance)
 
-    def smoothen_state_and_broadcast_transform(self):
+    def broadcast_transform(self, smoothen=False):
         pos_x, _, pos_y, _ = self.ukf.x
-        pos_x = self.wma(pos_x, self.rolling_pos_x, self.wma_weights)
-        pos_y = self.wma(pos_y, self.rolling_pos_y, self.wma_weights)
+        if smoothen:
+            pos_x = self.wma(pos_x, self.rolling_pos_x, self.wma_weights)
+            pos_y = self.wma(pos_y, self.rolling_pos_y, self.wma_weights)
 
         # Publish dynamic transform
         transform = TransformStamped()
