@@ -83,13 +83,13 @@ class PositionFilter(Node):
 
         # Update step of the filter
         measurement = msg.data
-        # self.ukf.hx = partial(self.measurement_function, offset=offset)
         self.ukf.update(z=measurement, hx=partial(self.measurement_function, offset=offset))
         self.prev_update_time = time_now
 
         self.smoothen_state_and_broadcast_transform()
         self.publish_state_and_covariance()
 
+        # self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
         # self.get_logger().info(f'Updated state: {self.ukf.x.tolist()}')
         # self.get_logger().info(f'Updated covariance: {np.diag(self.ukf.P).tolist()}')
 
