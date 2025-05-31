@@ -100,7 +100,7 @@ class PositionFilter(Node):
         # Predict step of the filter
         self.ukf.Q = Q_discrete_white_noise(dim=2, dt=time_elapsed, var=self.Q_std**2, block_size=2)
         self.ukf.predict(dt=time_elapsed)
-        self.publish_state_and_covariance()
+        # self.publish_state_and_covariance()
         if self.debug_log:
             self.get_logger().info(f'Predicted state: {self.ukf.x.tolist()} with dt: {time_elapsed}')
             self.get_logger().info(f'Predicted covariance: {np.diag(self.ukf.P).tolist()}')
