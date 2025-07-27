@@ -33,14 +33,14 @@ class PositionFilter(Node):
         self.child_frame = self.declare_parameter("child_frame", "follower/ukf_link").get_parameter_value().string_value
         self.Q_std = self.declare_parameter("Q_std", 0.03).get_parameter_value().double_value
         self.R_std = self.declare_parameter("R_std", 0.1).get_parameter_value().double_value
-        self.heading_std = self.declare_parameter("heading_std", 0.03).get_parameter_value().double_value
+        self.heading_std = self.declare_parameter("heading_std", 0.06).get_parameter_value().double_value
         self.debug_log = self.declare_parameter("debug_log", True).get_parameter_value().bool_value
 
         # Offsets
         self.leader1_offset = np.array([0., 0.])
         self.leader2_offset = np.array([0., 0.])
         self.follower_depth = 0.0
-        self.follower_heading = 0.0
+        self.follower_heading = None
 
         # UTM reference zone (will be set from first GPS message)
         self.utm_zone_number = None
@@ -87,11 +87,12 @@ class PositionFilter(Node):
         points = MerweScaledSigmaPoints(n=4, alpha=1e-2, beta=2., kappa=-1.0)
         self.dt = 1 / 200
         self.ukf = UnscentedKalmanFilter(dim_x=4, dim_z=1, dt=self.dt, hx=None, fx=self.state_transition_function, points=points, sqrt_fn=sqrtm)    
-        self.ukf.P = np.diag([0.01**2, 0.1**2, 0.05**2, 0.1**2])
+        self.ukf.P = np.diag([0.01**2, 0.1**2, 0.01**2, 0.1**2])
         # self.ukf.Q = Q_discrete_white_noise(dim=2, dt=dt, var=self.Q_std**2, block_size=2)
         self.ukf.R = np.array([self.R_std**2]) # Measurement noise
         self.initial_d1, self.initial_d2 = None, None
         self.prev_update_time = self.get_clock().now()
+        self.prev_distance_reading = 50
 
     def state_transition_function(self, x: np.ndarray, dt: float):
         pos_x, vel_x, pos_y, vel_y = x
@@ -105,7 +106,13 @@ class PositionFilter(Node):
     #     self.publish_state_and_covariance(self.ukf.x.tolist(), self.ukf.P.flatten().tolist())
     #     self.publish_state_gps(self.ukf.x[0], self.ukf.x[2], self.utm_zone_number, self.utm_zone_letter)
 
-    def measurement_cb(self, msg: Float32, offset: np.ndarray):        
+    def measurement_cb(self, msg: Float32, offset: np.ndarray):       
+        # Saving heading to self.follower_heading is needed only to compute the offset between gps and modem 
+        # if self.follower_heading is None and offset.shape == (1,):
+        #     heading = msg.data
+        #     self.get_logger().info(f'Follower heading set to: {heading} degrees')
+        #     self.follower_heading = radians(heading)
+
         # If initial state is not set, we take it from the first GPS message
         if np.array_equal(self.ukf.x, np.zeros(4)):
             return
@@ -121,6 +128,9 @@ class PositionFilter(Node):
         time_now = self.get_clock().now()
         time_elapsed = (time_now - self.prev_update_time).nanoseconds / 1e9
         time_elapsed = min(time_elapsed, 3.0)  # Limit time elapsed to avoid filter divergence due to too large predict covariance
+        # if time_elapsed <= 0:
+        #     self.get_logger().warn(f'Invalid time elapsed: {time_elapsed} seconds, skipping update.')
+        #     return
 
         # Predict step of the filter
         self.ukf.Q = Q_discrete_white_noise(dim=2, dt=time_elapsed, var=self.Q_std**2, block_size=2)
@@ -130,8 +140,11 @@ class PositionFilter(Node):
         # Update step of the filter
         measurement = msg.data
         if offset.shape == (2,):    # If offset is provided, we assume it's a distance measurement
+            R = self.R_std * (self.prev_distance_reading / measurement) ** 2
             measurement = np.sqrt(measurement**2 - self.follower_depth**2)  # Adjust measurement for depth
-            self.ukf.update(z=measurement, hx=partial(self.distance_measurement_function, offset=offset))
+            self.ukf.update(z=measurement, R=R**2, hx=partial(self.distance_measurement_function, offset=offset))
+            self.prev_distance_reading = measurement
+            self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed} and R: {R}')
         else:   # If no offset is provided, we assume it's a heading measurement
             measurement = radians(measurement)
             self.ukf.update(z=measurement, hx=self.heading_measurement_function, R=self.heading_std**2)
@@ -142,10 +155,11 @@ class PositionFilter(Node):
         self.broadcast_transform(smoothen=False)
         self.publish_state_and_covariance(self.ukf.x.tolist(), self.ukf.P.flatten().tolist())
         self.publish_state_gps(self.ukf.x[0], self.ukf.x[2], self.utm_zone_number, self.utm_zone_letter)
+        # self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
 
-        if self.debug_log:
-            self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
-            self.get_logger().info(f'Updated state: {self.ukf.x.tolist()}')
+        # if self.debug_log:
+        #     self.get_logger().info(f'Updating with measurement: {measurement} and offset: {offset.tolist()} and time elapsed: {time_elapsed}')
+        #     self.get_logger().info(f'Updated state: {self.ukf.x.tolist()}')
             # self.get_logger().info(f'Updated covariance: {np.diag(self.ukf.P).tolist()}')
 
     def leader_gps_cb(self, msg: NavSatFix, offset: np.ndarray):
@@ -157,7 +171,7 @@ class PositionFilter(Node):
                 self.utm_zone_letter = zone_letter
                 self.get_logger().info(f'UTM reference zone set to: {zone_number}{zone_letter}') 
             # Update the offset for the leader
-            offset[0], offset[1] = x, y
+            offset[0], offset[1] = x, y + 0.6  # Adjust y offset for the leader
         except Exception as e:
             self.get_logger().error(f'Error converting GPS to UTM: {e}')
             return
@@ -169,6 +183,10 @@ class PositionFilter(Node):
         # If initial state is not set, we take it from the first GPS message
         x, y, _, _ = from_latlon(msg.latitude, msg.longitude)
         if np.array_equal(self.ukf.x, np.zeros(4)):
+            # if self.follower_heading is not None:
+            #     baselink_to_modem_distance = 1.96
+            #     x += baselink_to_modem_distance * np.sin(self.follower_heading)
+            #     y += baselink_to_modem_distance * np.cos(self.follower_heading)
             self.ukf.x[0], self.ukf.x[2] = x, y  # pos_x, pos_y
             self.get_logger().info(f'Initial state set to: {self.ukf.x.tolist()}')
 

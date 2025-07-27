@@ -16,7 +16,7 @@ class PositionFilter(Node):
         super().__init__('position_filter')
 
         # Parameters
-        leader2_offset = self.declare_parameter("leader2_offset", -10.0).get_parameter_value().double_value
+        leader2_offset = self.declare_parameter("leader2_offset", -50.0).get_parameter_value().double_value
         leader1_distance_topic = self.declare_parameter("leader1_distance_topic", "distance_to_leader1").get_parameter_value().string_value
         leader2_distance_topic = self.declare_parameter("leader2_distance_topic", "distance_to_leader2").get_parameter_value().string_value
         state_topic = self.declare_parameter("state_topic", "ukf/state").get_parameter_value().string_value
